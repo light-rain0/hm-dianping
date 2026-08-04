@@ -1,5 +1,6 @@
 package com.hmdp.service.impl;
 
+import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.RandomUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
@@ -8,7 +9,6 @@ import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
-import lombok.val;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -34,39 +34,97 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     @Override
     public Result queryById(Long id) {
-
-        int randomNum = RandomUtil.randomInt(0, 30);
-
-        String key = CACHE_SHOP_KEY + id;
-        val boundValueOps = stringRedisTemplate.boundValueOps(key);
-        // 1.从redis中查询商铺缓存
-        String shopJson = boundValueOps.get();
-        // 2.判断是否存在
-        if (StrUtil.isNotBlank(shopJson)) {
-            // 3.存在直接返回
-            // 把 JSON 字符串转成 Shop 对象
-            Shop shop = JSONUtil.toBean(shopJson, Shop.class);
-            return Result.ok(shop);
-        }
-        // 判断redis是否为null
-        if (shopJson != null) {
-            return Result.fail("查询店铺不存在");
-        }
-
-        // 4.不存在,根据ID查询数据库
-        Shop shop = getById(id);
-
-        // 5.不存在,将空值写入redis
+        Shop shop = queryWithMutex(id);
         if (shop == null) {
-            boundValueOps.set("", CACHE_NULL_TTL, TimeUnit.MINUTES);
-            // 返回错误信息
-            return Result.fail("查询店铺不存在");
+            return Result.fail("店铺不存在");
+        }
+        return Result.ok(shop);
+    }
+
+    public Shop queryWithMutex(Long id) {
+        String key = CACHE_SHOP_KEY + id;
+        String lockKey = LOCK_SHOP_KEY + id;
+
+        // 1. 查缓存
+        String shopJson = stringRedisTemplate.opsForValue().get(key);
+        if (StrUtil.isNotBlank(shopJson)) {
+            return JSONUtil.toBean(shopJson, Shop.class);
+        }
+        if (shopJson != null) {   // 空值缓存命中
+            return null;
         }
 
-        // 6.存在写入redis
-        // 把shop对象转换成JSON字符串,作为value
-        boundValueOps.set(JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL + randomNum, TimeUnit.MINUTES);
-        return Result.ok(shop);
+        // 2. 抢锁（限次重试，避免无限递归）
+        Shop shop = null;
+        boolean isHoldLock = false;
+        int retry = 3;
+        try {
+            while (retry-- > 0) {
+                isHoldLock = tryLock(lockKey);
+                if (!isHoldLock) {
+                    Thread.sleep(50);
+                    continue;
+                }
+                // 3. 拿到锁后 double-check redis是否命中有就直接返回
+                shopJson = stringRedisTemplate.opsForValue().get(key);
+                if (StrUtil.isNotBlank(shopJson)) {
+                    return JSONUtil.toBean(shopJson, Shop.class);
+                }
+                // 4. 查 DB
+                shop = getById(id);
+                if (shop == null) {
+                    // redis设置null防止缓存穿透
+                    stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
+                    return null;
+                }
+                // 5. 写缓存
+                int randomNum = RandomUtil.randomInt(0, 30);
+                stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop),
+                        CACHE_SHOP_TTL + randomNum, TimeUnit.MINUTES);
+                return shop;
+            }
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        } finally {
+            if (isHoldLock) {
+                unLock(lockKey);
+            }
+        }
+        return shop;
+    }
+
+    /**
+     * 尝试获取分布式互斥锁（上锁）
+     * <p>
+     * 利用 Redis 的 SETNX 语义：只有当 key 不存在时才会写入成功。
+     * 由于 Redis 单线程执行命令，同一时刻多个并发线程同时来抢，只有一个能成功，
+     * 从而把「查 DB 重建缓存」这一步串行化，解决缓存击穿问题。
+     *
+     * @param key 锁的 key，通常用 LOCK_SHOP_KEY + 商品id，保证不同商品之间互不干扰
+     * @return true=抢锁成功（当前线程有权查 DB 并重建缓存）；false=锁已被别的线程持有，需等待重试
+     */
+    private boolean tryLock(String key) {
+        // setIfAbsent 对应 Redis 的 SETNX：key 不存在才写入，原子操作，并发下只有一个能成功
+        // 参数说明："1" 是占位的 value（内容不重要，只看 key 存不存在）；
+        //           LOCK_SHOP_TTL 是锁的过期时间（秒），即使持有锁的线程崩溃没执行 unLock，锁也会自动过期释放，避免死锁
+        Boolean flag = stringRedisTemplate.opsForValue()
+                .setIfAbsent(key, "1", LOCK_SHOP_TTL, TimeUnit.SECONDS);
+        // 返回值用 Boolean 包装类（可能为 null），用 BooleanUtil.isTrue 安全转换，
+        // 避免直接 return flag 在 null 时自动拆箱抛 NullPointerException
+        return BooleanUtil.isTrue(flag);
+    }
+
+    /**
+     * 释放分布式互斥锁（释放锁）
+     * <p>
+     * 删除锁对应的 key，让其他正在等待的线程可以抢到锁并重建缓存。
+     * 重要：调用方必须先通过 isHoldLock 判断「这把锁确实是当前线程持有的」再调用本方法，
+     * 绝不能释放别人持有的锁，否则会导致互斥失效、缓存击穿重现。
+     *
+     * @param key 要释放的锁 key
+     */
+    private void unLock(String key) {
+        stringRedisTemplate.delete(key);
     }
 
     @Override
