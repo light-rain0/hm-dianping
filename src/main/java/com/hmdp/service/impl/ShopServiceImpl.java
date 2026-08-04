@@ -10,10 +10,13 @@ import com.hmdp.service.IShopService;
 import lombok.val;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.Resource;
+import java.util.concurrent.TimeUnit;
 
 import static com.hmdp.utils.RedisConstants.CACHE_SHOP_KEY;
+import static com.hmdp.utils.RedisConstants.CACHE_SHOP_TTL;
 
 /**
  * <p>
@@ -53,7 +56,23 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
         // 6.存在写入redis
         // 把shop对象转换成JSON字符串,作为value
-        boundValueOps.set(JSONUtil.toJsonStr(shop));
+        boundValueOps.set(JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        return Result.ok(shop);
+    }
+
+    @Override
+    @Transactional
+    public Result update(Shop shop) {
+
+        // 1.更新数据库
+        updateById(shop);
+
+        Long shopId = shop.getId();
+        if (shopId == null) {
+            return Result.fail("店铺Id为空");
+        }
+        // 2.删除缓存
+        stringRedisTemplate.delete(CACHE_SHOP_KEY + shopId);
         return Result.ok(shop);
     }
 
