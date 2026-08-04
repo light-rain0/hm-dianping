@@ -1,5 +1,6 @@
 package com.hmdp.service.impl;
 
+import cn.hutool.core.util.RandomUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
@@ -34,6 +35,8 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Override
     public Result queryById(Long id) {
 
+        int randomNum = RandomUtil.randomInt(0, 30);
+
         String key = CACHE_SHOP_KEY + id;
         val boundValueOps = stringRedisTemplate.boundValueOps(key);
         // 1.从redis中查询商铺缓存
@@ -62,7 +65,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
         // 6.存在写入redis
         // 把shop对象转换成JSON字符串,作为value
-        boundValueOps.set(JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        boundValueOps.set(JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL + randomNum, TimeUnit.MINUTES);
         return Result.ok(shop);
     }
 
